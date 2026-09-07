@@ -14,9 +14,15 @@ const readmePaths = [
 
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 const currentVersion = manifest.version || '1.0.0';
-const parts = currentVersion.split('.').map(Number);
-parts[2] = (parts[2] || 0) + 1;
-const newVersion = parts.join('.');
+const specifiedVersion = process.argv[2];
+let newVersion;
+if (specifiedVersion) {
+  newVersion = specifiedVersion;
+} else {
+  const parts = currentVersion.split('.').map(Number);
+  parts[2] = (parts[2] || 0) + 1;
+  newVersion = parts.join('.');
+}
 
 manifest.version = newVersion;
 fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
