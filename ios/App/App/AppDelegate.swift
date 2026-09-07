@@ -305,8 +305,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
     private var isAudioSessionInterrupted: Bool = false
     private var isCurrentlyPlaying: Bool = false
     private var authoritativeNowPlayingInfo: [String: Any] = [:]
-    private var silencePlayer: AVAudioPlayer?
-    private var silencePauseTimer: Timer?
     private var nowPlayingGuardianTimer: Timer?
     private var sentenceWatchdogTimer: Timer?
     private var isUserNavigatingPrevious: Bool = false
@@ -323,93 +321,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
         super.init()
     }
 
-    // MARK: - Native Silence Keep-Alive Player
-    // Generates a 2-second 44.1kHz 16-bit mono silence PCM WAV buffer with sub-audible 1-LSB dither (-90.3 dBFS)
-    private func createSilentAudioData() -> Data {
-        let sampleRate: Int32 = 44100
-        let numChannels: Int16 = 1
-        let bitsPerSample: Int16 = 16
-        let numSamples: Int32 = sampleRate * 2
-        let dataSize: Int32 = numSamples * Int32(numChannels) * Int32(bitsPerSample / 8)
-        let chunkSize: Int32 = 36 + dataSize
-        
-        var data = Data()
-        data.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // "RIFF"
-        var chunkSizeBytes = chunkSize.littleEndian
-        data.append(Data(bytes: &chunkSizeBytes, count: 4))
-        data.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // "WAVE"
-        data.append(contentsOf: [0x66, 0x6d, 0x74, 0x20]) // "fmt "
-        var subchunk1Size: Int32 = Int32(16).littleEndian
-        data.append(Data(bytes: &subchunk1Size, count: 4))
-        var audioFormat: Int16 = Int16(1).littleEndian // PCM
-        data.append(Data(bytes: &audioFormat, count: 2))
-        var channels = numChannels.littleEndian
-        data.append(Data(bytes: &channels, count: 2))
-        var sRate = sampleRate.littleEndian
-        data.append(Data(bytes: &sRate, count: 4))
-        var byteRate: Int32 = (sampleRate * Int32(numChannels) * Int32(bitsPerSample / 8)).littleEndian
-        data.append(Data(bytes: &byteRate, count: 4))
-        var blockAlign: Int16 = (numChannels * (bitsPerSample / 8)).littleEndian
-        data.append(Data(bytes: &blockAlign, count: 2))
-        var bps = bitsPerSample.littleEndian
-        data.append(Data(bytes: &bps, count: 2))
-        data.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // "data"
-        var dSize = dataSize.littleEndian
-        data.append(Data(bytes: &dSize, count: 4))
-        
-        var pcmData = Data(capacity: Int(dataSize))
-        var samplePos: Int16 = Int16(1).littleEndian
-        var sampleNeg: Int16 = Int16(-1).littleEndian
-        for i in 0..<numSamples {
-            if i % 2 == 0 {
-                pcmData.append(Data(bytes: &samplePos, count: 2))
-            } else {
-                pcmData.append(Data(bytes: &sampleNeg, count: 2))
-            }
-        }
-        data.append(pcmData)
-        return data
-    }
-
-    private func ensureSilencePlayer() {
-        if silencePlayer == nil {
-            let silentData = createSilentAudioData()
-            do {
-                silencePlayer = try AVAudioPlayer(data: silentData)
-                silencePlayer?.numberOfLoops = -1
-                silencePlayer?.volume = 0.001
-                silencePlayer?.prepareToPlay()
-            } catch {
-                print("[NativeTTS] Failed to initialize silencePlayer: \(error)")
-            }
-        }
-    }
-
-    func startSilencePlayer() {
-        if self.isNativeEngineActive {
-            return
-        }
-        self.activateAudioSession()
-        cancelSilencePauseTimer()
-        ensureSilencePlayer()
-        if silencePlayer?.isPlaying == false {
-            silencePlayer?.play()
-            writeAppLog("NativeTTS", "Silence keep-alive player running (keeps WebKit process alive)")
-        }
-    }
-
-    func stopSilencePlayer() {
-        cancelSilencePauseTimer()
-        silencePlayer?.stop()
-        silencePlayer = nil
-        writeAppLog("NativeTTS", "Silence keep-alive player stopped")
-    }
-
-    func scheduleSilencePauseTimer() {
-        cancelSilencePauseTimer()
-        stopSilencePlayer()
-    }
-
     func deactivateAudioSession() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self, !self.isCurrentlyPlaying else { return }
@@ -419,13 +330,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             } catch {
                 writeAppLog("NativeTTS", "Failed to deactivate AVAudioSession: \(error.localizedDescription)")
             }
-        }
-    }
-
-    func cancelSilencePauseTimer() {
-        DispatchQueue.main.async { [weak self] in
-            self?.silencePauseTimer?.invalidate()
-            self?.silencePauseTimer = nil
         }
     }
 
@@ -487,9 +391,9 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                     return
                 }
 
-                // Only assert .playing if audio hardware is actually rendering audio (activePlayer or silencePlayer)
+                // Only assert .playing if audio hardware is actually rendering audio (activePlayer)
                 // Asserting .playing when 0 audio players are active can cause iOS mediaserverd watchdog termination
-                let isHardwareAudioActive = (self.activePlayer?.isPlaying == true) || (self.silencePlayer?.isPlaying == true)
+                let isHardwareAudioActive = (self.activePlayer?.isPlaying == true)
                 guard isHardwareAudioActive else { return }
 
                 if #available(iOS 13.0, *) {
@@ -540,7 +444,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             self.preparedPlayer?.pause()
         }
 
-        self.stopSilencePlayer()
         self.syncNowPlaying(isPlaying: false)
         self.deactivateAudioSession()
 
@@ -786,7 +689,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
         pendingResumeWorkItem = nil
         endCallInterruptionBgTask()
         endInterruptionResumeBgTask()
-        stopSilencePlayer()
         stopNowPlayingGuardian()
         playerA?.stop()
         playerA = nil
@@ -1147,7 +1049,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             self.isCurrentlyPlaying = true
             self.wasPlayingBeforeInterruption = false
             self.isAudioSessionInterrupted = false
-            self.stopSilencePlayer()
             self.endInterruptionResumeBgTask()
             self.endSentenceGapBgTask()
             self.startNowPlayingGuardian()
@@ -1398,7 +1299,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             self.endSentenceGapBgTask()
             self.activePlayer?.pause()
             self.preparedPlayer?.pause()
-            self.stopSilencePlayer()
             self.syncNowPlaying(isPlaying: false)
             self.deactivateAudioSession()
             call.resolve()
@@ -1410,8 +1310,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             guard let self = self else { return }
             writeAppLog("NativeTTS", "resumeNative called from JS (isNativeEngineActive=\(self.isNativeEngineActive))")
             self.activateAudioSession()
-            self.cancelSilencePauseTimer()
-            self.stopSilencePlayer()
             self.isCurrentlyPlaying = true
             self.wasPlayingBeforeInterruption = false
             self.wasPlayingBeforeCall = false
@@ -1491,7 +1389,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                 }
             }
 
-            self.startSilencePlayer()
             self.syncNowPlaying(isPlaying: true)
             call.resolve(["resumed": false, "message": "No player ready"])
         }
@@ -1519,7 +1416,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             self.playerB?.stop()
             self.playerB = nil
 
-            self.stopSilencePlayer()
             self.endInterruptionResumeBgTask()
             self.stopNowPlayingGuardian()
             self.updateRemoteCommandsState(isPlaying: false)
@@ -1621,7 +1517,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                 self.activateAudioSession()
                 self.wasPlayingBeforeInterruption = false
                 self.isAudioSessionInterrupted = false
-                self.stopSilencePlayer()
                 self.endInterruptionResumeBgTask()
                 self.startNowPlayingGuardian()
             } else {
@@ -1630,7 +1525,7 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                     self.isAudioSessionInterrupted = false
                 }
                 self.stopNowPlayingGuardian()
-                self.scheduleSilencePauseTimer()
+                self.deactivateAudioSession()
             }
         }
         self.updateRemoteCommandsState(isPlaying: self.isCurrentlyPlaying)
@@ -1653,7 +1548,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                 self.activateAudioSession()
                 self.wasPlayingBeforeInterruption = false
                 self.isAudioSessionInterrupted = false
-                self.stopSilencePlayer()
                 self.endInterruptionResumeBgTask()
                 self.startNowPlayingGuardian()
             } else {
@@ -1662,7 +1556,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                     self.isAudioSessionInterrupted = false
                 }
                 self.stopNowPlayingGuardian()
-                self.stopSilencePlayer()
                 self.deactivateAudioSession()
             }
             self.syncNowPlaying(isPlaying: isPlaying)
@@ -1687,7 +1580,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                     self.activateAudioSession()
                     self.wasPlayingBeforeInterruption = false
                     self.isAudioSessionInterrupted = false
-                    self.stopSilencePlayer()
                     self.endInterruptionResumeBgTask()
                     self.startNowPlayingGuardian()
                 } else {
@@ -1696,7 +1588,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                         self.isAudioSessionInterrupted = false
                     }
                     self.stopNowPlayingGuardian()
-                    self.stopSilencePlayer()
                     self.deactivateAudioSession()
                 }
             }
@@ -1714,7 +1605,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
         self.currentArtwork = nil
         self.lastCoverBase64 = ""
         self.authoritativeNowPlayingInfo = [:]
-        self.stopSilencePlayer()
         self.endInterruptionResumeBgTask()
         self.stopNowPlayingGuardian()
         self.updateRemoteCommandsState(isPlaying: false)
@@ -1747,7 +1637,7 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             "currentPlayingSentenceIndex": self.currentPlayingSentenceIndex,
             "preparedSentenceIndex": self.preparedSentenceIndex,
             "nativePlayerPlaying": (self.activePlayer?.isPlaying ?? false),
-            "silencePlayerRunning": (self.silencePlayer?.isPlaying ?? false),
+            "silencePlayerRunning": false,
             "playbackState": stateStr,
             "playbackRate": rate,
             "nowPlayingTitle": title
@@ -2020,8 +1910,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                 self?.activateAudioSession()
             }
         }
-        self.cancelSilencePauseTimer()
-        self.stopSilencePlayer()
         self.isCurrentlyPlaying = true
         self.wasPlayingBeforeInterruption = false
         self.wasPlayingBeforeCall = false
@@ -2131,7 +2019,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
         }
 
         // Fallback for HTML5 / WebKit audio path
-        self.startSilencePlayer()
         self.startNowPlayingGuardian()
         self.syncNowPlaying(isPlaying: true)
 
@@ -2191,7 +2078,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             self.stopSentenceWatchdog()
             self.activePlayer?.pause()
             self.preparedPlayer?.pause()
-            self.stopSilencePlayer()
             self.syncNowPlaying(isPlaying: false)
             self.deactivateAudioSession()
             self.notifyListeners("mediaAction", data: ["action": "pause"])
@@ -2205,7 +2091,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
         }
 
         // Fallback for HTML5 / WebKit audio path
-        self.stopSilencePlayer()
         self.syncNowPlaying(isPlaying: false)
         self.deactivateAudioSession()
 
@@ -2324,7 +2209,6 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
         self.wasPlayingBeforeInterruption = false
         self.wasPlayingBeforeCall = false
         self.isAudioSessionInterrupted = false
-        self.stopSilencePlayer()
         self.stopSentenceWatchdog()
         self.endInterruptionResumeBgTask()
         self.stopNowPlayingGuardian()

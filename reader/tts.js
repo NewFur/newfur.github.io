@@ -2174,8 +2174,8 @@ export class TTSEngine {
         }
       }
 
-      // 如果當前沒有任何音訊在播放（或者當前音訊已暫停/播放結束），為防止 iOS 挂起 JavaScript，應立刻啟動靜音播放器保活
-      if ((!this.currentAudio || this.currentAudio.paused || this.currentAudio.ended) && this.silenceAudio) {
+      // 如果當前沒有任何音訊在播放（或者當前音訊已暫停/播放結束），為防止純網頁版 iOS Safari 挂起 JavaScript，應立刻啟動靜音播放器保活
+      if (!this._isNativeEngineAvailable() && (!this.currentAudio || this.currentAudio.paused || this.currentAudio.ended) && this.silenceAudio) {
         this.silenceAudio.play().catch(e => console.warn("Failed to resume silence on cache miss:", e));
       }
       return;
@@ -2737,25 +2737,28 @@ export class TTSEngine {
 
     const isCapacitorApp = typeof window !== 'undefined' && window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.NativeTTS;
 
-    // 1. 初始化並在用戶手勢中解鎖靜音保活播放器 (維持 iOS WebKit WebContent 音訊管道活躍)
-    if (!this.silenceAudio) {
-      this.silenceAudio = new Audio();
-      this.silenceAudio.src = 'data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV';
-      this.silenceAudio.loop = true;
-      this.silenceAudio.volume = 0.001;
-      this.silenceAudio.preload = 'auto';
-    }
-    try {
-      const pSilence = this.silenceAudio.play();
-      if (pSilence && typeof pSilence.then === 'function') {
-        pSilence.then(() => {
-          // 若當前未在播放 TTS，解鎖成功後暫停靜音播放器，避免背景耗電
-          if (!this.isPlaying || this.isPaused) {
-            this.silenceAudio.pause();
-          }
-        }).catch(() => {});
+    // 1. 初始化並在用戶手勢中解鎖靜音保活播放器 (僅純網頁瀏覽器用於維持 iOS Mobile Safari WebContent 音訊管道活躍)
+    // 原生 App (iOS / Android) 使用原生雙播放器引擎 (Route B)，完全不使用 WebKit 靜音播放器
+    if (!isCapacitorApp && !this._isNativeEngineAvailable()) {
+      if (!this.silenceAudio) {
+        this.silenceAudio = new Audio();
+        this.silenceAudio.src = 'data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV';
+        this.silenceAudio.loop = true;
+        this.silenceAudio.volume = 0.001;
+        this.silenceAudio.preload = 'auto';
       }
-    } catch (e) {}
+      try {
+        const pSilence = this.silenceAudio.play();
+        if (pSilence && typeof pSilence.then === 'function') {
+          pSilence.then(() => {
+            // 若當前未在播放 TTS，解鎖成功後暫停靜音播放器，避免背景耗電
+            if (!this.isPlaying || this.isPaused) {
+              this.silenceAudio.pause();
+            }
+          }).catch(() => {});
+        }
+      } catch (e) {}
+    }
 
     // 2. 在用戶手勢中同步預熱音訊播放器，使其獲得 WebKit Autoplay 授權
     const SILENCE_DATA_URI = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
@@ -2912,8 +2915,8 @@ export class TTSEngine {
             this.fetchingIndices.delete(groupInfo.groupStartIndex);
           }
           this._fetchSentence(idx);
-          // 只有在未暫停且播放中時才保活
-          if (this.isPlaying && !this.isPaused && this.silenceAudio && this.silenceAudio.paused) {
+          // 只有在未暫停且播放中時才保活 (僅純網頁版)
+          if (!this._isNativeEngineAvailable() && this.isPlaying && !this.isPaused && this.silenceAudio && this.silenceAudio.paused) {
             this.silenceAudio.play().catch(() => {});
           }
         }
