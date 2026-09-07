@@ -55,13 +55,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Configure audio session for background TTS playback (.allowAirPlay, .allowBluetooth, .allowBluetoothA2DP)
+        // Configure audio session category for background TTS playback (.allowAirPlay, .allowBluetoothHFP, .allowBluetoothA2DP)
         do {
             let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playback, mode: .default, options: [.allowAirPlay, .allowBluetooth, .allowBluetoothA2DP])
-            try audioSession.setActive(true)
+            try audioSession.setCategory(.playback, mode: .default, options: [.allowAirPlay, .allowBluetoothHFP, .allowBluetoothA2DP])
+            // Do NOT activate audio session at launch. Only activate when playback begins,
+            // preventing our app from stealing Bluetooth audio or occupying audio routes prematurely.
         } catch {
-            print("[NativeTTS] Failed to configure AVAudioSession at launch: \(error)")
+            print("[NativeTTS] Failed to configure AVAudioSession category at launch: \(error)")
         }
 
         // Automatic storage maintenance: purge temporary files, capped debug logs, and WebKit disk cache
@@ -406,25 +407,17 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
 
     func scheduleSilencePauseTimer() {
         cancelSilencePauseTimer()
-        if self.isNativeEngineActive {
-            // Route B uses native AVAudioPlayer directly.
-            // Playing silence during pause in Route B causes iOS CoreAudio to detect active audio output,
-            // which forces the lock screen / Control Center to show ⏸ (playing) instead of ▶ (paused).
-            stopSilencePlayer()
-            return
-        }
-        startSilencePlayer()
-        DispatchQueue.main.async { [weak self] in
-            // Keep silence player alive for 30 minutes after pause, preventing iOS from freezing WKWebView
-            self?.silencePauseTimer = Timer.scheduledTimer(withTimeInterval: 30 * 60, repeats: false) { [weak self] _ in
-                guard let self = self else { return }
-                if !self.isCurrentlyPlaying {
-                    print("[NativeTTS] 30min pause timeout reached, stopping silence player to conserve battery")
-                    self.stopSilencePlayer()
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-                    }
-                }
+        stopSilencePlayer()
+    }
+
+    func deactivateAudioSession() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self, !self.isCurrentlyPlaying else { return }
+            do {
+                try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                writeAppLog("NativeTTS", "AVAudioSession successfully deactivated with .notifyOthersOnDeactivation")
+            } catch {
+                writeAppLog("NativeTTS", "Failed to deactivate AVAudioSession: \(error.localizedDescription)")
             }
         }
     }
@@ -547,9 +540,9 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             self.preparedPlayer?.pause()
         }
 
-        // Immediately pause silence player to prevent any audio hardware output
-        self.silencePlayer?.pause()
+        self.stopSilencePlayer()
         self.syncNowPlaying(isPlaying: false)
+        self.deactivateAudioSession()
 
         let updateWebViewBlock = { [weak self] in
             guard let self = self else { return }
@@ -575,7 +568,7 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
     func activateAudioSession() -> Bool {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.allowAirPlay, .allowBluetooth, .allowBluetoothA2DP])
+            try session.setCategory(.playback, mode: .default, options: [.allowAirPlay, .allowBluetoothHFP, .allowBluetoothA2DP])
             try session.setActive(true)
             return true
         } catch {
@@ -1407,6 +1400,7 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             self.preparedPlayer?.pause()
             self.stopSilencePlayer()
             self.syncNowPlaying(isPlaying: false)
+            self.deactivateAudioSession()
             call.resolve()
         }
     }
@@ -1535,9 +1529,7 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             if #available(iOS 13.0, *) {
                 MPNowPlayingInfoCenter.default().playbackState = .stopped
             }
-            DispatchQueue.global(qos: .userInitiated).async {
-                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            }
+            self.deactivateAudioSession()
             call.resolve()
         }
     }
@@ -1670,7 +1662,8 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                     self.isAudioSessionInterrupted = false
                 }
                 self.stopNowPlayingGuardian()
-                self.scheduleSilencePauseTimer()
+                self.stopSilencePlayer()
+                self.deactivateAudioSession()
             }
             self.syncNowPlaying(isPlaying: isPlaying)
         }
@@ -1703,7 +1696,8 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                         self.isAudioSessionInterrupted = false
                     }
                     self.stopNowPlayingGuardian()
-                    self.scheduleSilencePauseTimer()
+                    self.stopSilencePlayer()
+                    self.deactivateAudioSession()
                 }
             }
         }
@@ -1730,13 +1724,7 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
                 MPNowPlayingInfoCenter.default().playbackState = .stopped
             }
         }
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            } catch {
-                print("[NativeTTS] Failed to deactivate AVAudioSession on stop: \(error)")
-            }
-        }
+        self.deactivateAudioSession()
         call.resolve()
     }
 
@@ -2205,6 +2193,7 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
             self.preparedPlayer?.pause()
             self.stopSilencePlayer()
             self.syncNowPlaying(isPlaying: false)
+            self.deactivateAudioSession()
             self.notifyListeners("mediaAction", data: ["action": "pause"])
             DispatchQueue.main.async { [weak self] in
                 self?.bridge?.webView?.evaluateJavaScript(
@@ -2216,8 +2205,9 @@ public class NativeTTS: CAPPlugin, CAPBridgedPlugin, AVAudioPlayerDelegate, CXCa
         }
 
         // Fallback for HTML5 / WebKit audio path
-        self.scheduleSilencePauseTimer()
+        self.stopSilencePlayer()
         self.syncNowPlaying(isPlaying: false)
+        self.deactivateAudioSession()
 
         var bgTaskId: UIBackgroundTaskIdentifier = .invalid
         bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "RemotePausePlayback") {
