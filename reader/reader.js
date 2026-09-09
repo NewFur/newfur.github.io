@@ -309,6 +309,41 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // 0.4 立即同步恢復主題設定，杜絕頁面閃爍 (Anti-FOUC)
+  let initialTheme = null;
+  try {
+    const raw = localStorage.getItem('theme');
+    if (raw) {
+      try { initialTheme = JSON.parse(raw); } catch (e) { initialTheme = raw; }
+    }
+  } catch (e) {}
+  if (!initialTheme && window.matchMedia) {
+    initialTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'mint';
+  }
+  initialTheme = initialTheme || 'mint';
+  applyThemeToDOM(initialTheme);
+
+  // 與 chrome.storage.local 保持同步與校準（支援擴充功能環境）
+  chrome.storage.local.get(['theme'], (res) => {
+    if (res && res.theme) {
+      if (res.theme !== initialTheme) {
+        applyThemeToDOM(res.theme);
+      }
+      try { localStorage.setItem('theme', JSON.stringify(res.theme)); } catch (e) {}
+    }
+  });
+
+  if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+      chrome.storage.local.get(['theme'], (res) => {
+        if (!res.theme) {
+          const newTheme = e.matches ? 'dark' : 'mint';
+          applyThemeToDOM(newTheme);
+        }
+      });
+    });
+  }
+
   // 0.5 立即套用封面大小設定以防佈局抖動
   const savedWidth = localStorage.getItem('coverWidth') || '180';
   document.documentElement.style.setProperty('--cover-width', `${savedWidth}px`);
@@ -336,33 +371,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 3. 初始化 AI 配置與檢測支持
   await initAISettings();
   await initTTSSettings();
-
-  // 3.5 立即恢復主題設定（支援 iOS 系統暗黑偏好自適應）
-  chrome.storage.local.get(['theme'], (res) => {
-    let themeToApply = res.theme;
-    if (!themeToApply) {
-      const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-      themeToApply = prefersDark ? 'dark' : 'mint';
-    }
-    const classesToRemove = Array.from(document.body.classList).filter(c => c.startsWith('theme-'));
-    classesToRemove.forEach(c => document.body.classList.remove(c));
-    document.body.classList.add(`theme-${themeToApply}`);
-    updateNativeStatusBarStyle(themeToApply);
-  });
-
-  if (window.matchMedia) {
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
-      chrome.storage.local.get(['theme'], (res) => {
-        if (!res.theme) {
-          const newTheme = e.matches ? 'dark' : 'mint';
-          const classesToRemove = Array.from(document.body.classList).filter(c => c.startsWith('theme-'));
-          classesToRemove.forEach(c => document.body.classList.remove(c));
-          document.body.classList.add(`theme-${newTheme}`);
-          updateNativeStatusBarStyle(newTheme);
-        }
-      });
-    });
-  }
 
   // 4. 綁定按鈕事件
   initUIEventBindings();
@@ -6375,11 +6383,21 @@ function initThemeAndStyles() {
   });
 }
 
-function setTheme(theme, writeToStorage = true) {
-  const classesToRemove = Array.from(document.body.classList).filter(c => c.startsWith('theme-'));
-  classesToRemove.forEach(c => document.body.classList.remove(c));
+function applyThemeToDOM(theme) {
+  if (!theme) return;
+  const bodyClassesToRemove = Array.from(document.body.classList).filter(c => c.startsWith('theme-'));
+  bodyClassesToRemove.forEach(c => document.body.classList.remove(c));
   document.body.classList.add(`theme-${theme}`);
+
+  const rootClassesToRemove = Array.from(document.documentElement.classList).filter(c => c.startsWith('theme-'));
+  rootClassesToRemove.forEach(c => document.documentElement.classList.remove(c));
+  document.documentElement.classList.add(`theme-${theme}`);
+
   updateNativeStatusBarStyle(theme);
+}
+
+function setTheme(theme, writeToStorage = true) {
+  applyThemeToDOM(theme);
   
   // Update active mind-elixir mindmaps to match theme
   if (typeof activeMindElixirs !== 'undefined') {
@@ -6400,6 +6418,7 @@ function setTheme(theme, writeToStorage = true) {
 
   if (writeToStorage) {
     chrome.storage.local.set({ theme });
+    try { localStorage.setItem('theme', JSON.stringify(theme)); } catch (e) {}
     if (currentBook) {
       saveProgressDebounced({ theme });
     }
